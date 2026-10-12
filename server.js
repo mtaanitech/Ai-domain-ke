@@ -1,130 +1,247 @@
-// server.js - FIXED REAL GLOBAL - NO 403 BUG
-import express from "express";
-import cors from "cors";
-import pg from "pg";
-import path from "path";
-import { fileURLToPath } from "url";
+require("dotenv").config();
+const express = require("express");
+const helmet = require("helmet");
+const cors = require("cors");
+const morgan = require("morgan");
+const path = require("path");
+const { Pool } = require("pg");
 
 const app = express();
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const port = process.env.PORT || 3000;
+
+const ROOT_HOST = process.env.ROOT_HOST || "mtaani-ai-domain.onrender.com";
+const ADMIN_KEY = process.env.ADMIN_KEY || "change-this-admin-key";
+const EXPORT_DIR = process.env.EXPORT_DIR || "exports";
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false
+});
+
+app.use(helmet());
 app.use(cors());
-app.use(express.json());
+app.use(morgan("dev"));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, "public")));
 
-let logs = [];
-let jobs = {};
-function addLog(msg, type="info"){
-  const entry = { time: new Date().toISOString(), msg, type };
-  logs.push(entry);
-  if(logs.length>200) logs.shift();
-  console.log(`[${type}] ${msg}`);
+function publicUrlFor(domain) {
+  if (!domain) return null;
+  const clean = String(domain).trim().toLowerCase();
+  return `https://${clean}.${ROOT_HOST}`;
 }
 
-const pool = process.env.DATABASE_URL? new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl:{rejectUnauthorized:false}
-}): null;
+function isValidDomainName(input) {
+  if (!input || typeof input !== "string") return false;
+  const value = input.trim().toLowerCase();
+  if (!/^[a-z0-9-]+$/.test(value)) return false;
+  if (value.length < 3 || value.length > 63) return false;
+  return true;
+}
 
-const ALLOWED_TLDS = [".com",".co.ke",".ke",".net",".org",".app",".store",".xyz"];
-const isValidDomain = d=>ALLOWED_TLDS.some(t=>d.endsWith(t)) && /^[a-z0-9-]+\.[a-z.]+$/.test(d);
+function normalizeDomain(input) {
+  return String(input).trim().toLowerCase().replace(/[^a-z0-9-]/g, "");
+}
 
-app.get("/api/logs", (req,res)=> res.json({ logs: logs.slice(-50), jobs }));
-app.get("/api/logs/stream", (req,res)=>{
-  res.setHeader('Content-Type','text/event-stream');
-  res.setHeader('Cache-Control','no-cache');
-  res.setHeader('Connection','keep-alive');
-  const interval = setInterval(()=>{
-    res.write(`data: ${JSON.stringify({ logs: logs.slice(-30), jobs })}\n\n`);
-  }, 1000);
-  req.on('close',()=>clearInterval(interval));
+app.use((req, res, next) => {
+  const host = req.hostname || "";
+  if (host && host.endsWith(`.${ROOT_HOST}`)) {
+    req.virtualDomain = host.slice(0, -(`.${ROOT_HOST}`.length + 1));
+  } else {
+    req.virtualDomain = null;
+  }
+  next();
 });
 
-app.get("/api/health",(req,res)=>{
-  res.json({ok:true, mode:"REAL FIXED NO-403", tlds:ALLOWED_TLDS});
+app.get("/api/health", async (req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ ok: true, status: "healthy", root_host: ROOT_HOST });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: "db-unhealthy", detail: err.message });
+  }
 });
 
-// === FIXED CHECK FUNCTION ===
-async function realCheck(domain){
-  const tld = domain.split('.').pop();
-  const isCoKe = domain.endsWith('.co.ke');
+app.get("/api/check", async (req, res) => {
+  const domain = normalizeDomain(req.query.domain || "");
+  if (!isValidDomainName(domain)) {
+    return res.status(400).json({ ok: false, error: "invalid-domain" });
+  }
 
-  let urls = [];
-  if(isCoKe) urls.push(`https://rdap.kenic.or.ke/rdap/domain/${domain}`);
-  if(tld==='com' || tld==='net') urls.push(`https://rdap.verisign.com/com/v1/domain/${domain}`);
-  else if(tld==='org') urls.push(`https://rdap.publicinterestregistry.net/rdap/domain/${domain}`);
-  urls.push(`https://rdap.org/domain/${domain}`); // last try
+  try {
+    const result = await pool.query(
+      "SELECT id FROM domains WHERE domain_lower = $1 LIMIT 1",
+      [domain]
+    );
 
-  for(const url of urls){
-    try{
-      addLog(`Trying ${url}`,"info");
-      const r = await fetch(url, { headers: { 'Accept':'application/json' }, signal: AbortSignal.timeout(8000) });
-      addLog(`RDAP response for ${domain}: ${r.status} from ${new URL(url).hostname}`,"info");
-      if(r.status===404) return { available: true };
-      if(r.status===200) return { available: false };
-      if(r.status===403 || r.status===429) continue; // try next
-    }catch(e){
-      addLog(`Fail ${url}: ${e.message}`,"error");
-      continue;
+    const taken = result.rowCount > 0;
+    return res.json({
+      ok: true,
+      domain,
+      taken,
+      available: !taken,
+      public_url: publicUrlFor(domain),
+      source: "this_system_db"
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/register", async (req, res) => {
+  const key = req.headers["x-admin-key"];
+  if (!key || key !== ADMIN_KEY) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+
+  const raw = req.body && req.body.domain ? req.body.domain : "";
+  const owner = req.body && req.body.owner ? String(req.body.owner).trim() : "unknown";
+  const domain = normalizeDomain(raw);
+
+  if (!isValidDomainName(domain)) {
+    return res.status(400).json({ ok: false, error: "invalid-domain" });
+  }
+
+  try {
+    const exists = await pool.query(
+      "SELECT id FROM domains WHERE domain_lower = $1 LIMIT 1",
+      [domain]
+    );
+
+    if (exists.rowCount > 0) {
+      return res.status(409).json({
+        ok: false,
+        error: "domain-already-registered",
+        domain,
+        public_url: publicUrlFor(domain)
+      });
+    }
+
+    const insert = await pool.query(
+      `INSERT INTO domains (domain, domain_lower, owner, status, created_at)
+       VALUES ($1, $2, $3, 'active', NOW())
+       RETURNING *`,
+      [domain, domain, owner]
+    );
+
+    const row = insert.rows[0];
+    return res.status(201).json({
+      ok: true,
+      message: "Domain registered",
+      domain: row,
+      public_url: publicUrlFor(row.domain_lower)
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/domains", async (req, res) => {
+  const key = req.headers["x-admin-key"];
+  if (!key || key !== ADMIN_KEY) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT id, domain, owner, status, created_at FROM domains ORDER BY id DESC LIMIT 100"
+    );
+    res.json({ ok: true, domains: result.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/generate", async (req, res) => {
+  const base = (req.query.idea || "startup").toString().trim().toLowerCase();
+  if (!base) {
+    return res.status(400).json({ ok: false, error: "idea-required" });
+  }
+
+  const cleaned = base
+    .replace(/[^a-z0-9\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .slice(0, 25);
+
+  const keywords = ["studio", "hub", "labs", "works", "co", "app", "market", "portal", "network"];
+  const suggestions = [];
+  const used = new Set();
+
+  for (const kw of keywords) {
+    const s = `${cleaned}-${kw}`.replace(/-+/g, "-");
+    if (s && !used.has(s)) {
+      used.add(s);
+      suggestions.push({ domain: s, public_url: publicUrlFor(s) });
     }
   }
 
-  // FINAL FALLBACK: Cloudflare DNS - if no A record = likely FREE
-  try{
-    const dns = await fetch(`https://cloudflare-dns.com/dns-query?name=${domain}&type=A`, { headers: { accept: 'application/dns-json' } });
-    const j = await dns.json();
-    if(!j.Answer || j.Answer.length===0){
-      addLog(`Fallback DNS: ${domain} has NO record => AVAILABLE`,"success");
-      return { available: true, fallback: true };
-    } else {
-      addLog(`Fallback DNS: ${domain} HAS record => TAKEN`,"error");
-      return { available: false, fallback: true };
+  return res.json({ ok: true, suggestions });
+});
+
+app.get("/", async (req, res) => {
+  if (req.virtualDomain) {
+    try {
+      const result = await pool.query(
+        "SELECT id, domain, owner, status FROM domains WHERE domain_lower = $1 LIMIT 1",
+        [req.virtualDomain]
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(404).send("Domain not found");
+      }
+
+      const domain = result.rows[0];
+      return res.send(`
+        <html>
+          <head><title>${domain.domain}</title></head>
+          <body>
+            <h1>${domain.domain}</h1>
+            <p>Owner: ${domain.owner}</p>
+            <p>Status: ${domain.status}</p>
+          </body>
+        </html>
+      `);
+    } catch (err) {
+      return res.status(500).send("Error resolving domain");
     }
-  }catch(e){
-    return { available: false, error: e.message };
+  }
+
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: "not-found" });
+});
+
+async function initDb() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS domains (
+        id SERIAL PRIMARY KEY,
+        domain TEXT NOT NULL UNIQUE,
+        domain_lower TEXT NOT NULL UNIQUE,
+        owner TEXT,
+        status TEXT DEFAULT 'active',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_domains_domain_lower
+      ON domains(domain_lower);
+    `);
+
+    console.log("Database initialized");
+  } catch (err) {
+    console.error("DB init failed:", err.message);
+    process.exit(1);
   }
 }
 
-app.get("/api/check", async (req,res)=>{
-  const domain=(req.query.domain||"").toLowerCase().trim();
-  if(!isValidDomain(domain)) return res.status(400).json({error:`Use: ${ALLOWED_TLDS.join(", ")}`});
-
-  const jobId = `check_${Date.now()}`;
-  jobs[jobId]={domain,status:"checking",start:new Date().toISOString()};
-  addLog(`START checking ${domain} worldwide via REAL RDAP...`,"check");
-
-  const result = await realCheck(domain);
-  jobs[jobId].status = result.available? "available" : "taken";
-  addLog(`${domain} is ${result.available? 'AVAILABLE ✅' : 'TAKEN ❌'}`,"info");
-  res.json({domain, available: result.available, jobId,...result});
-});
-
-app.post("/api/clone", async (req,res)=>{
-  const {repoUrl}=req.body;
-  const jobId=`clone_${Date.now()}`;
-  jobs[jobId]={repoUrl,status:"cloning",start:new Date().toISOString()};
-  addLog(`START cloning ${repoUrl}`,"clone");
-  try{
-    const match=repoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
-    if(!match) throw new Error("Invalid github url");
-    const user=match[1], repo=match[2].replace(".git","");
-    addLog(`Fetching GitHub API for ${user}/${repo}...`,"info");
-    const apiRes=await fetch(`https://api.github.com/repos/${user}/${repo}`);
-    const info=await apiRes.json();
-    addLog(`Found repo: ${info.full_name} - ${info.stargazers_count} stars`,"success");
-    const base=(info.name||repo).toLowerCase().replace(/[^a-z0-9]/g,"").slice(0,12);
-    let domains=[`${base}.com`,`${base}app.com`,`${base}.app`,`${base}.co.ke`,`${base}hub.com`];
-    jobs[jobId].status="done";
-    addLog(`CLONE done - suggested ${domains.length} domains for ${base}`,"success");
-    res.json({ok:true,jobId,cloned:{user,repo,description:info.description,stars:info.stargazers_count},suggested_domains:domains});
-  }catch(e){
-    jobs[jobId].status="error";
-    addLog(`Clone failed: ${e.message}`,"error");
-    res.status(500).json({error:e.message,jobId});
-  }
-});
-
-app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"public","index.html")));
-const PORT=process.env.PORT||10000;
-app.listen(PORT,()=>{
-  addLog(`Server started on ${PORT} - FIXED REAL GLOBAL NO 403 BUG`,"success");
-});
+(async () => {
+  await initDb();
+  app.listen(port, () => {
+    console.log(`App listening on http://localhost:${port}`);
+  });
+})();
