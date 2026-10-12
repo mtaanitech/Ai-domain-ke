@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mtaani AI Domain System</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 20px;
+      background: #0b1020;
+      color: #f1f5f9;
+      font-family: Arial, sans-serif;
+    }
+
+    main {
+      max-width: 720px;
+      margin: 35px auto;
+    }
+
+    header, section {
+      background: #151d31;
+      padding: 22px;
+      border-radius: 14px;
+      margin-bottom: 18px;
+    }
+
+    h1 {
+      color: #60a5fa;
+    }
+
+    input, button {
+      width: 100%;
+      padding: 13px;
+      margin-top: 10px;
+      border-radius: 8px;
+      font-size: 16px;
+    }
+
+    input {
+      background: #0b1020;
+      color: white;
+      border: 1px solid #475569;
+    }
+
+    button {
+      background: #2563eb;
+      color: white;
+      border: none;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #1d4ed8;
+    }
+
+    .result {
+      margin-top: 14px;
+      overflow-wrap: anywhere;
+    }
+
+    .muted {
+      color: #cbd5e1;
+      line-height: 1.6;
+    }
+
+    footer {
+      text-align: center;
+      color: #94a3b8;
+      margin-top: 25px;
+    }
+  </style>
+</head>
+
+<body>
+  <main>
+    <header>
+      <h1>Mtaani AI 🌐</h1>
+      <p class="muted">
+        Domain Management System
+      </p>
+      <p class="muted">
+        Check and manage domain records in your system.
+      </p>
+    </header>
+
+    <section>
+      <h2>Check Domain</h2>
+
+      <form id="checkForm">
+        <input
+          id="checkDomain"
+          type="text"
+          placeholder="example.com"
+          required
+        >
+        <button type="submit">Check Domain</button>
+      </form>
+
+      <div id="checkResult" class="result"></div>
+    </section>
+
+    <section>
+      <h2>Register Domain</h2>
+      <p class="muted">
+        Admin access is required to save a record.
+      </p>
+
+      <form id="registerForm">
+        <input
+          id="registerDomain"
+          type="text"
+          placeholder="example.com"
+          required
+        >
+
+        <input
+          id="owner"
+          type="text"
+          maxlength="120"
+          placeholder="Owner name"
+          required
+        >
+
+        <button type="submit">Register Record</button>
+      </form>
+
+      <div id="registerResult" class="result"></div>
+    </section>
+
+    <section>
+      <h2>Admin: View Records</h2>
+
+      <button id="listButton" type="button">
+        Load Domain Records
+      </button>
+
+      <div id="listResult" class="result"></div>
+    </section>
+
+    <footer>
+      Mtaani AI Domain System
+    </footer>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    async function request(url, options = {}) {
+      const response = await fetch(url, options);
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "Request failed");
+      }
+
+      return data;
+    }
+
+    $("checkForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      const domain = $("checkDomain").value.trim();
+      const output = $("checkResult");
+
+      output.textContent = "Checking...";
+
+      try {
+        const data = await request(
+          "/api/check?domain=" + encodeURIComponent(domain)
+        );
+
+        output.textContent = data.registered
+          ? domain + " is already recorded in this system."
+          : domain + " is not recorded in this system.";
+
+      } catch (error) {
+        output.textContent = error.message;
+      }
+    });
+
+    $("registerForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      const domain = $("registerDomain").value.trim();
+      const owner = $("owner").value.trim();
+      const output = $("registerResult");
+
+      const key = prompt("Enter your admin key:");
+
+      if (!key) {
+        output.textContent = "Admin key required.";
+        return;
+      }
+
+      output.textContent = "Saving...";
+
+      try {
+        const data = await request("/api/register", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-admin-key": key
+          },
+          body: JSON.stringify({ domain, owner })
+        });
+
+        output.textContent = data.message;
+        $("registerForm").reset();
+
+      } catch (error) {
+        output.textContent = error.message;
+      }
+    });
+
+    $("listButton").addEventListener("click", async () => {
+      const key = prompt("Enter your admin key:");
+      const output = $("listResult");
+
+      if (!key) {
+        output.textContent = "Admin key required.";
+        return;
+      }
+
+      output.textContent = "Loading...";
+
+      try {
+        const data = await request("/api/domains", {
+          headers: {
+            "x-admin-key": key
+          }
+        });
+
+        output.replaceChildren();
+
+        if (data.domains.length === 0) {
+          output.textContent = "No domain records yet.";
+          return;
+        }
+
+        data.domains.forEach((item) => {
+          const row = document.createElement("p");
+
+          row.textContent =
+            item.domain + " — " +
+            item.owner + " — " +
+            new Date(item.created_at).toLocaleString();
+
+          output.appendChild(row);
+        });
+
+      } catch (error) {
+        output.textContent = error.message;
+      }
+    });
+  </script>
+</body>
+</html>
