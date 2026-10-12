@@ -1,224 +1,130 @@
-const express = require("express");
-const { Pool } = require("pg");
-const crypto = require("crypto");
-const path = require("path");
+// server.js - REAL GLOBAL + CLONE + LIVE TAIL
+import express from "express";
+import cors from "cors";
+import pg from "pg";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.use(express.json({ limit: "10kb" }));
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+app.use(cors());
+app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-const DATABASE_URL = process.env.DATABASE_URL;
-const ADMIN_KEY = process.env.ADMIN_KEY;
+// --- LIVE TAIL SYSTEM ---
+let logs = [];
+let jobs = {}; // jobId -> status
 
-if (!DATABASE_URL) {
-  console.error("Missing DATABASE_URL environment variable.");
-  process.exit(1);
+function addLog(msg, type="info"){
+  const entry = { time: new Date().toISOString(), msg, type };
+  logs.push(entry);
+  if(logs.length>200) logs.shift();
+  console.log(`[${type}] ${msg}`);
 }
 
-if (!ADMIN_KEY || ADMIN_KEY.length < 24) {
-  console.error("ADMIN_KEY must contain at least 24 characters.");
-  process.exit(1);
-}
+const pool = process.env.DATABASE_URL? new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl:{rejectUnauthorized:false}
+}): null;
 
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 5,
-  connectionTimeoutMillis: 10000,
-  idleTimeoutMillis: 30000
+const ALLOWED_TLDS = [".com",".co.ke",".ke",".net",".org",".app",".store",".xyz"];
+const isValidDomain = d=>ALLOWED_TLDS.some(t=>d.endsWith(t)) && /^[a-z0-9-]+\.[a-z.]+$/.test(d);
+
+// 1. LIVE TAIL ENDPOINT - for frontend
+app.get("/api/logs", (req,res)=>{
+  res.json({ logs: logs.slice(-50), jobs });
 });
 
-function isValidDomain(domain) {
-  if (typeof domain !== "string") return false;
-
-  const value = domain.trim().toLowerCase();
-
-  if (value.length > 253 || value.length < 4) return false;
-
-  const labels = value.split(".");
-
-  if (labels.length < 2) return false;
-
-  return labels.every((label) =>
-    label.length >= 1 &&
-    label.length <= 63 &&
-    /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)
-  );
-}
-
-function requireAdmin(req, res, next) {
-  const suppliedKey = req.get("x-admin-key") || "";
-
-  const expected = Buffer.from(ADMIN_KEY);
-  const supplied = Buffer.from(suppliedKey);
-
-  if (
-    supplied.length !== expected.length ||
-    !crypto.timingSafeEqual(supplied, expected)
-  ) {
-    return res.status(401).json({
-      ok: false,
-      error: "Unauthorized"
-    });
-  }
-
-  next();
-}
-
-app.get("/api/health", async (req, res) => {
-  try {
-    await pool.query("SELECT 1");
-
-    res.json({
-      ok: true,
-      database: "connected"
-    });
-  } catch (error) {
-    console.error("Database health check failed.");
-
-    res.status(503).json({
-      ok: false,
-      database: "unavailable"
-    });
-  }
+// SSE LIVE TAIL - real time stream
+app.get("/api/logs/stream", (req,res)=>{
+  res.setHeader('Content-Type','text/event-stream');
+  res.setHeader('Cache-Control','no-cache');
+  res.setHeader('Connection','keep-alive');
+  const interval = setInterval(()=>{
+    res.write(`data: ${JSON.stringify({ logs: logs.slice(-30), jobs })}\n\n`);
+  }, 1000);
+  req.on('close',()=>clearInterval(interval));
 });
 
-app.get("/api/check", async (req, res) => {
-  const domain = String(req.query.domain || "")
-    .trim()
-    .toLowerCase();
-
-  if (!isValidDomain(domain)) {
-    return res.status(400).json({
-      ok: false,
-      error: "Enter a valid domain name, e.g. example.com"
-    });
-  }
-
-  try {
-    const result = await pool.query(
-      `SELECT EXISTS (
-         SELECT 1
-         FROM public.domains
-         WHERE domain_lower = $1
-       ) AS registered`,
-      [domain]
-    );
-
-    const registered = result.rows[0].registered;
-
-    res.json({
-      ok: true,
-      domain,
-      registered,
-      availableInThisSystem: !registered,
-      note: "This checks this system's database, not public domain registration."
-    });
-  } catch (error) {
-    console.error("Domain lookup failed.");
-
-    res.status(500).json({
-      ok: false,
-      error: "Could not check domain right now."
-    });
-  }
+// 2. HEALTH + BACKGROUND STATUS
+app.get("/api/health",(req,res)=>{
+  addLog("Health check","info");
+  res.json({ok:true, mode:"REAL+CLONE+LIVE_TAIL", tlds:ALLOWED_TLDS, jobs_count:Object.keys(jobs).length});
 });
 
-app.post("/api/register", requireAdmin, async (req, res) => {
-  const domain = String(req.body.domain || "")
-    .trim()
-    .toLowerCase();
+// 3. REAL CHECK WITH BACKGROUND LOGS
+app.get("/api/check", async (req,res)=>{
+  const domain=(req.query.domain||"").toLowerCase().trim();
+  if(!isValidDomain(domain)) return res.status(400).json({error:`Use: ${ALLOWED_TLDS.join(", ")}`});
 
-  const owner = String(req.body.owner || "").trim();
+  const jobId = `check_${Date.now()}`;
+  jobs[jobId]={domain,status:"checking",start:new Date().toISOString()};
+  addLog(`START checking ${domain} worldwide via RDAP...`,"check");
 
-  if (!isValidDomain(domain)) {
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid domain name."
-    });
-  }
+  try{
+    const r=await fetch(`https://rdap.org/domain/${domain}`,{signal:AbortSignal.timeout(8000)});
+    addLog(`RDAP response for ${domain}: ${r.status}`,"info");
 
-  if (!owner || owner.length > 120) {
-    return res.status(400).json({
-      ok: false,
-      error: "Owner is required and must be at most 120 characters."
-    });
-  }
-
-  try {
-    const result = await pool.query(
-      `INSERT INTO public.domains (domain, owner)
-       VALUES ($1, $2)
-       ON CONFLICT (domain_lower) DO NOTHING
-       RETURNING id, domain, owner, created_at`,
-      [domain, owner]
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(409).json({
-        ok: false,
-        error: "This domain already exists in this system."
-      });
+    if(r.status===404){
+      jobs[jobId].status="available";
+      addLog(`${domain} is AVAILABLE ✅`,"success");
+      return res.json({domain,available:true, jobId});
     }
-
-    res.status(201).json({
-      ok: true,
-      message: "Domain record created.",
-      domain: result.rows[0]
-    });
-  } catch (error) {
-    console.error("Domain registration failed.");
-
-    res.status(500).json({
-      ok: false,
-      error: "Could not save domain."
-    });
+    if(r.status===200){
+      jobs[jobId].status="taken";
+      addLog(`${domain} is TAKEN ❌`,"error");
+      return res.json({domain,available:false, jobId});
+    }
+    jobs[jobId].status="unknown";
+    return res.json({domain,available:false,jobId});
+  }catch(e){
+    addLog(`RDAP error for ${domain}: ${e.message}`,"error");
+    jobs[jobId].status="error";
+    return res.status(500).json({error:e.message, jobId});
   }
 });
 
-app.get("/api/domains", requireAdmin, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, domain, owner, created_at
-       FROM public.domains
-       ORDER BY created_at DESC
-       LIMIT 100`
-    );
+// 4. CLONE WITH BACKGROUND
+app.post("/api/clone", async (req,res)=>{
+  const {repoUrl}=req.body;
+  const jobId=`clone_${Date.now()}`;
+  jobs[jobId]={repoUrl,status:"cloning",start:new Date().toISOString()};
+  addLog(`START cloning ${repoUrl}`,"clone");
 
-    res.json({
-      ok: true,
-      count: result.rowCount,
-      domains: result.rows
-    });
-  } catch (error) {
-    console.error("Could not list domain records.");
+  try{
+    const match=repoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+    if(!match) throw new Error("Invalid github url");
+    const user=match[1], repo=match[2].replace(".git","");
 
-    res.status(500).json({
-      ok: false,
-      error: "Could not retrieve records."
-    });
+    addLog(`Fetching GitHub API for ${user}/${repo}...`,"info");
+    const apiRes=await fetch(`https://api.github.com/repos/${user}/${repo}`);
+    const info=await apiRes.json();
+    addLog(`Found repo: ${info.full_name} - ${info.stargazers_count} stars`,"success");
+
+    let pkg={};
+    try{
+      addLog(`Checking package.json...`,"info");
+      const pkgRes=await fetch(`https://raw.githubusercontent.com/${user}/${repo}/main/package.json`);
+      if(pkgRes.ok){ pkg=await pkgRes.json(); addLog(`package.json found: ${pkg.name}`,"success"); }
+    }catch{}
+
+    const base=(info.name||repo).toLowerCase().replace(/[^a-z0-9]/g,"").slice(0,12);
+    let domains=[`${base}.com`,`${base}app.com`,`${base}.app`,`${base}.co.ke`,`${base}hub.com`];
+
+    jobs[jobId].status="done";
+    addLog(`CLONE done - suggested ${domains.length} domains for ${base}`,"success");
+
+    res.json({ok:true,jobId,cloned:{user,repo,description:info.description,stars:info.stargazers_count},suggested_domains:domains});
+
+  }catch(e){
+    jobs[jobId].status="error";
+    addLog(`Clone failed: ${e.message}`,"error");
+    res.status(500).json({error:e.message,jobId});
   }
 });
 
-app.use((req, res) => {
-  res.status(404).json({
-    ok: false,
-    error: "Endpoint not found."
-  });
+app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"public","index.html")));
+const PORT=process.env.PORT||10000;
+app.listen(PORT,()=>{
+  addLog(`Server started on ${PORT} - REAL GLOBAL + LIVE TAIL active`,"success");
 });
-
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Mtaani AI API listening on port ${PORT}`);
-});
-
-async function shutdown() {
-  server.close(async () => {
-    await pool.end();
-    process.exit(0);
-  });
-}
-
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
